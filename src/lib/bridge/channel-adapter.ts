@@ -54,6 +54,19 @@ export abstract class BaseChannelAdapter {
   }
 
   /**
+   * Edit inline keyboard buttons on an existing message.
+   * Used by question-broker for multi-select toggle UI.
+   * Not all platforms support this — default implementation is a no-op.
+   */
+  async editMessageButtons(
+    _chatId: string,
+    _messageId: string,
+    _buttons: Array<Array<{ text: string; callbackData: string }>>,
+  ): Promise<void> {
+    // No-op by default; override in adapters that support inline keyboard editing
+  }
+
+  /**
    * Validate that the adapter's configuration is complete.
    * Returns null if valid, or an error message string if invalid.
    */

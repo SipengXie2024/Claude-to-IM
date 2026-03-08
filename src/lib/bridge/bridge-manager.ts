@@ -611,7 +611,7 @@ async function handleMessage(
         msg.messageId,
       );
     }, taskAbort.signal, hasAttachments ? msg.attachments : undefined, onPartialText, async (auq) => {
-      await questionBroker.forwardAskUserQuestion(adapter, msg.address, auq);
+      await questionBroker.forwardAskUserQuestion(adapter, msg.address, auq as Parameters<typeof questionBroker.forwardAskUserQuestion>[2]);
     });
 
     // Send response text — render via channel-appropriate format

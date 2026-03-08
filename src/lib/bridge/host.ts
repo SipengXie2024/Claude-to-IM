@@ -230,6 +230,7 @@ export interface PermissionResolution {
   behavior: 'allow' | 'deny';
   message?: string;
   updatedPermissions?: unknown[];
+  updatedInput?: Record<string, unknown>;
 }
 
 export interface PermissionGateway {
