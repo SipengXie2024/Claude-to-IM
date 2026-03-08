@@ -30,6 +30,17 @@ import {
 
 const GLOBAL_KEY = '__bridge_manager__';
 
+/** Known bridge commands that are handled inline (no session lock needed). */
+const BRIDGE_COMMANDS = new Set([
+  '/start', '/new', '/bind', '/cwd', '/mode',
+  '/status', '/sessions', '/stop', '/perm', '/help',
+]);
+
+function isBridgeCommand(text: string): boolean {
+  const command = text.split(/\s+/)[0].split('@')[0].toLowerCase();
+  return BRIDGE_COMMANDS.has(command);
+}
+
 // ── Streaming preview helpers ──────────────────────────────────
 
 /** Generate a non-zero random 31-bit integer for use as draft_id. */
@@ -366,9 +377,13 @@ function runAdapterLoop(adapter: BaseChannelAdapter): void {
         const msg = await adapter.consumeOne();
         if (!msg) continue; // Adapter stopped
 
-        // Callback queries and commands are lightweight — process inline.
-        // Regular messages use per-session locking for concurrency.
-        if (msg.callbackData || msg.text.trim().startsWith('/')) {
+        // Callback queries and known bridge commands are lightweight — process
+        // inline so /stop works even during active tasks (no session lock).
+        // Unknown slash commands (skills) and regular messages go through
+        // per-session locking for concurrency.
+        if (msg.callbackData) {
+          await handleMessage(adapter, msg);
+        } else if (msg.text.trim().startsWith('/') && isBridgeCommand(msg.text.trim())) {
           await handleMessage(adapter, msg);
         } else {
           const binding = router.resolve(msg.address);
@@ -462,14 +477,21 @@ async function handleMessage(
   }
 
   // Check for IM commands (before sanitization — commands are validated individually)
+  let effectiveText = rawText;
   if (rawText.startsWith('/')) {
-    await handleCommand(adapter, msg, rawText);
-    ack();
-    return;
+    const handled = await handleCommand(adapter, msg, rawText);
+    if (handled) {
+      ack();
+      return;
+    }
+    // Unknown command — forward to Claude as regular message.
+    // Convert underscores back to hyphens for skill name matching
+    // (Telegram commands only allow underscores, but skills use hyphens).
+    effectiveText = rawText.replace(/^(\/\w+)/, (cmd) => cmd.replace(/_/g, '-'));
   }
 
-  // Sanitize general message text before routing to conversation engine
-  const { text, truncated } = sanitizeInput(rawText);
+  // Sanitize message text before routing to conversation engine
+  const { text, truncated } = sanitizeInput(effectiveText);
   if (truncated) {
     console.warn(`[bridge-manager] Input truncated from ${rawText.length} to ${text.length} chars for chat ${msg.address.chatId}`);
     store.insertAuditLog({
@@ -618,12 +640,13 @@ async function handleMessage(
 
 /**
  * Handle IM slash commands.
+ * Returns true if the command was handled, false if it should be forwarded to Claude.
  */
 async function handleCommand(
   adapter: BaseChannelAdapter,
   msg: InboundMessage,
   text: string,
-): Promise<void> {
+): Promise<boolean> {
   const { store } = getBridgeContext();
 
   // Extract command and args (handle /command@botname format)
@@ -648,7 +671,7 @@ async function handleCommand(
       parseMode: 'plain',
       replyToMessageId: msg.messageId,
     });
-    return;
+    return true;
   }
 
   let response = '';
@@ -664,7 +687,7 @@ async function handleCommand(
         '/new [path] - Start new session',
         '/bind &lt;session_id&gt; - Bind to existing session',
         '/cwd /path - Change working directory',
-        '/mode plan|code|ask - Change mode',
+        '/mode plan|code|ask|bypass - Change mode',
         '/status - Show current status',
         '/sessions - List recent sessions',
         '/stop - Stop current session',
@@ -724,7 +747,7 @@ async function handleCommand(
 
     case '/mode': {
       if (!validateMode(args)) {
-        response = 'Usage: /mode plan|code|ask';
+        response = 'Usage: /mode plan|code|ask|bypass';
         break;
       }
       const binding = router.resolve(msg.address);
@@ -802,7 +825,7 @@ async function handleCommand(
         '/new [path] - Start new session',
         '/bind &lt;session_id&gt; - Bind to existing session',
         '/cwd /path - Change working directory',
-        '/mode plan|code|ask - Change mode',
+        '/mode plan|code|ask|bypass - Change mode',
         '/status - Show current status',
         '/sessions - List recent sessions',
         '/stop - Stop current session',
@@ -812,7 +835,8 @@ async function handleCommand(
       break;
 
     default:
-      response = `Unknown command: ${escapeHtml(command)}\nType /help for available commands.`;
+      // Unknown command — not a bridge command, let caller forward to Claude.
+      return false;
   }
 
   if (response) {
@@ -823,6 +847,7 @@ async function handleCommand(
       replyToMessageId: msg.messageId,
     });
   }
+  return true;
 }
 
 // ── SDK Session Update Logic ─────────────────────────────────

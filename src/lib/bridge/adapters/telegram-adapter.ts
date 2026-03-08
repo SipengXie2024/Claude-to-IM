@@ -6,6 +6,8 @@
  */
 
 import crypto from 'crypto';
+import fs from 'fs';
+import path from 'path';
 import type {
   ChannelType,
   InboundMessage,
@@ -34,6 +36,105 @@ const DEDUP_SET_MAX = 1000;
 /** Derive a short token-specific hash for per-bot offset isolation. */
 function tokenShortHash(botToken: string): string {
   return crypto.createHash('sha256').update(botToken).digest('hex').slice(0, 8);
+}
+
+/** Convert a skill/command name to a valid Telegram command (lowercase, digits, underscores, max 32 chars). */
+function toTelegramCommand(name: string): string {
+  return name.replace(/-/g, '_').replace(/[^a-z0-9_]/gi, '').toLowerCase().slice(0, 32);
+}
+
+/**
+ * Discover all available slash commands from three sources:
+ * 1. Local skills: ~/.claude/skills/<name>/SKILL.md (frontmatter name + description)
+ * 2. Plugin commands: commands/<name>.md (filename = command name)
+ * 3. Plugin agents: agents/<name>.md (agent name = command name)
+ *
+ * Results are filtered against enabledPlugins in settings to avoid showing disabled plugin commands.
+ */
+async function discoverSkillCommands(): Promise<Array<{ command: string; description: string }>> {
+  const homeDir = process.env.HOME || '/root';
+  const claudeDir = path.join(homeDir, '.claude');
+  const seen = new Set<string>();
+  const commands: Array<{ command: string; description: string }> = [];
+
+  function addCommand(cmd: string, desc: string): void {
+    if (!cmd || seen.has(cmd)) return;
+    seen.add(cmd);
+    commands.push({ command: cmd, description: desc.slice(0, 256) });
+  }
+
+  /** Parse YAML frontmatter from a SKILL.md file. */
+  function parseFrontmatter(content: string): { name?: string; description?: string } {
+    const fmMatch = content.match(/^---\s*\n([\s\S]*?)\n---/);
+    if (!fmMatch) return {};
+    const fm = fmMatch[1];
+    const nameMatch = fm.match(/^name:\s*(.+)$/m);
+    const descMatch = fm.match(/^description:\s*(.+)$/m);
+    return {
+      name: nameMatch?.[1]?.trim(),
+      description: descMatch?.[1]?.trim(),
+    };
+  }
+
+  // 1. Local skills: ~/.claude/skills/*/SKILL.md
+  const skillsDir = path.join(claudeDir, 'skills');
+  try {
+    const entries = await fs.promises.readdir(skillsDir, { withFileTypes: true });
+    for (const entry of entries) {
+      if (!entry.isDirectory()) continue;
+      try {
+        const content = await fs.promises.readFile(path.join(skillsDir, entry.name, 'SKILL.md'), 'utf-8');
+        const { name, description } = parseFrontmatter(content);
+        if (name) addCommand(toTelegramCommand(name), description || name);
+      } catch { /* skip */ }
+    }
+  } catch { /* skills dir doesn't exist */ }
+
+  // 2 & 3. Plugin commands and skills — only from enabled plugins
+  let enabledPlugins: Record<string, boolean> = {};
+  for (const p of ['settings.local.json', 'settings.json']) {
+    try {
+      const settings = JSON.parse(await fs.promises.readFile(path.join(claudeDir, p), 'utf-8'));
+      enabledPlugins = settings.enabledPlugins || {};
+      break;
+    } catch { /* try next */ }
+  }
+
+  let installedPlugins: Record<string, Array<{ installPath: string }>> = {};
+  try {
+    const registry = JSON.parse(await fs.promises.readFile(path.join(claudeDir, 'plugins', 'installed_plugins.json'), 'utf-8'));
+    installedPlugins = registry.plugins || {};
+  } catch { return commands; }
+
+  for (const [pluginKey, enabled] of Object.entries(enabledPlugins)) {
+    if (!enabled) continue;
+    const entries = installedPlugins[pluginKey];
+    if (!entries || entries.length === 0) continue;
+    const pluginDir = entries[0].installPath;
+
+    // 2. Plugin commands: commands/*.md → filename is the slash command name
+    const cmdsDir = path.join(pluginDir, 'commands');
+    try {
+      const cmdFiles = await fs.promises.readdir(cmdsDir);
+      for (const f of cmdFiles) {
+        if (!f.endsWith('.md')) continue;
+        const cmdName = f.replace(/\.md$/, '');
+        const tgCmd = toTelegramCommand(cmdName);
+        try {
+          const content = await fs.promises.readFile(path.join(cmdsDir, f), 'utf-8');
+          const { description } = parseFrontmatter(content);
+          addCommand(tgCmd, description || cmdName);
+        } catch {
+          addCommand(tgCmd, cmdName);
+        }
+      }
+    } catch { /* no commands dir */ }
+
+    // Agents are not registered as TG commands — they are subagents
+    // invoked programmatically by Claude, not user-facing slash commands.
+  }
+
+  return commands;
 }
 
 interface TelegramUpdate {
@@ -337,22 +438,44 @@ export class TelegramAdapter extends BaseChannelAdapter {
 
   /**
    * Register slash commands with Telegram Bot API so they appear in the menu.
+   * Includes bridge commands + dynamically discovered user skills.
    */
   private async registerCommands(): Promise<void> {
     const token = this.botToken;
     if (!token) return;
 
+    const bridgeCommands = [
+      { command: 'new', description: 'Start new session (optionally specify path)' },
+      { command: 'bind', description: 'Bind to existing session' },
+      { command: 'cwd', description: 'Change working directory' },
+      { command: 'mode', description: 'Switch mode: plan / code / ask' },
+      { command: 'status', description: 'Show current session status' },
+      { command: 'sessions', description: 'List recent sessions' },
+      { command: 'stop', description: 'Stop current task' },
+      { command: 'help', description: 'Show available commands' },
+    ];
+
+    // Claude Code built-in commands usable via SDK query()
+    const builtInCommands = [
+      { command: 'compact', description: 'Compact conversation to free up context' },
+      { command: 'plan', description: 'Enter plan mode' },
+      { command: 'cost', description: 'Show token usage statistics' },
+    ];
+
+    // Claude Code bundled skills (prompt-based, fully supported via SDK)
+    const bundledSkills = [
+      { command: 'simplify', description: 'Review changed code for reuse, quality, and efficiency' },
+      { command: 'batch', description: 'Orchestrate large-scale changes across codebase in parallel' },
+      { command: 'debug', description: 'Troubleshoot current session by reading debug log' },
+      { command: 'loop', description: 'Run a prompt repeatedly on an interval' },
+      { command: 'claude_api', description: 'Load Claude API reference for your language' },
+    ];
+
+    // Discover user skills from ~/.claude/skills/
+    const skillCommands = await discoverSkillCommands();
+
     await callTelegramApi(token, 'setMyCommands', {
-      commands: [
-        { command: 'new', description: 'Start new session (optionally specify path)' },
-        { command: 'bind', description: 'Bind to existing session' },
-        { command: 'cwd', description: 'Change working directory' },
-        { command: 'mode', description: 'Switch mode: plan / code / ask' },
-        { command: 'status', description: 'Show current session status' },
-        { command: 'sessions', description: 'List recent sessions' },
-        { command: 'stop', description: 'Stop current task' },
-        { command: 'help', description: 'Show available commands' },
-      ],
+      commands: [...bridgeCommands, ...builtInCommands, ...bundledSkills, ...skillCommands],
     });
   }
 
