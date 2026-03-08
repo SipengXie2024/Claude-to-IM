@@ -29,12 +29,15 @@
   },
   "files": ["dist", "src/lib"],
   "scripts": {
-    "build": "tsc -p tsconfig.build.json",
-    "prepare": "npm run build",
+    "build:lib": "tsc -p tsconfig.build.json",
+    "build:daemon": "node scripts/build.js",
+    "build": "npm run build:lib && npm run build:daemon",
+    "prepare": "npm run build:lib",
     "typecheck": "tsc --noEmit",
     "test:unit": "node --test --import tsx --test-timeout=15000 src/__tests__/unit/bridge-*.test.ts",
     "test": "npm run typecheck && npm run test:unit",
-    "example": "npx tsx src/lib/bridge/examples/mock-host.ts"
+    "example": "npx tsx src/lib/bridge/examples/mock-host.ts",
+    "deploy": "npm run build && cp dist/daemon.mjs ~/.claude/skills/claude-to-im/dist/daemon.mjs"
   },
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "^0.2.62",
@@ -43,10 +46,14 @@
     "markdown-it": "^14.1.1",
     "ws": "^8.18.0"
   },
+  "optionalDependencies": {
+    "@openai/codex-sdk": "^0.110.0"
+  },
   "devDependencies": {
     "@types/markdown-it": "^14.1.2",
     "@types/ws": "^8.5.0",
     "@types/node": "^22.0.0",
+    "esbuild": "^0.25.0",
     "tsx": "^4.21.0",
     "typescript": "^5"
   },
