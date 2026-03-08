@@ -307,6 +307,28 @@ export class TelegramAdapter extends BaseChannelAdapter {
     return callTelegramApi(token, 'sendMessage', params);
   }
 
+  async editMessageButtons(
+    chatId: string,
+    messageId: string,
+    buttons: Array<Array<{ text: string; callbackData: string }>>,
+  ): Promise<void> {
+    const token = this.botToken;
+    if (!token) return;
+
+    await callTelegramApi(token, 'editMessageReplyMarkup', {
+      chat_id: chatId,
+      message_id: messageId,
+      reply_markup: {
+        inline_keyboard: buttons.map(row =>
+          row.map(btn => ({
+            text: btn.text,
+            callback_data: btn.callbackData,
+          }))
+        ),
+      },
+    });
+  }
+
   async answerCallback(callbackQueryId: string, text?: string): Promise<void> {
     const token = this.botToken;
     if (!token) return;

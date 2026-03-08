@@ -39,6 +39,17 @@ export type OnPermissionRequest = (perm: PermissionRequestInfo) => Promise<void>
  */
 export type OnPartialText = (fullText: string) => void;
 
+export interface AskUserQuestionInfo {
+  toolUseID: string;
+  questions: unknown[];
+}
+
+/**
+ * Callback invoked immediately when an ask_user_question SSE event arrives.
+ * Same deadlock-breaking pattern as OnPermissionRequest.
+ */
+export type OnAskUserQuestion = (info: AskUserQuestionInfo) => Promise<void>;
+
 export interface ConversationResult {
   responseText: string;
   tokenUsage: TokenUsage | null;
@@ -61,6 +72,7 @@ export async function processMessage(
   abortSignal?: AbortSignal,
   files?: FileAttachment[],
   onPartialText?: OnPartialText,
+  onAskUserQuestion?: OnAskUserQuestion,
 ): Promise<ConversationResult> {
   const { store, llm } = getBridgeContext();
   const sessionId = binding.codepilotSessionId;
@@ -178,7 +190,7 @@ export async function processMessage(
     // Consume the stream server-side (replicate collectStreamResponse pattern).
     // Permission requests are forwarded immediately via the callback during streaming
     // because the stream blocks until permission is resolved — we can't wait until after.
-    return await consumeStream(stream, sessionId, onPermissionRequest, onPartialText);
+    return await consumeStream(stream, sessionId, onPermissionRequest, onPartialText, onAskUserQuestion);
   } finally {
     clearInterval(renewalInterval);
     store.releaseSessionLock(sessionId, lockId);
@@ -208,6 +220,7 @@ async function consumeStream(
   sessionId: string,
   onPermissionRequest?: OnPermissionRequest,
   onPartialText?: OnPartialText,
+  onAskUserQuestion?: OnAskUserQuestion,
 ): Promise<ConversationResult> {
   const { store } = getBridgeContext();
   const reader = stream.getReader();
@@ -326,6 +339,23 @@ async function consumeStream(
               if (onPermissionRequest) {
                 onPermissionRequest(perm).catch((err) => {
                   console.error('[conversation-engine] Failed to forward permission request:', err);
+                });
+              }
+            } catch { /* skip */ }
+            break;
+          }
+
+          case 'ask_user_question': {
+            try {
+              const auqData = JSON.parse(event.data);
+              const info: AskUserQuestionInfo = {
+                toolUseID: auqData.toolUseID,
+                questions: auqData.questions || [],
+              };
+              // Forward immediately — same deadlock-breaking pattern as permission_request
+              if (onAskUserQuestion) {
+                onAskUserQuestion(info).catch((err) => {
+                  console.error('[conversation-engine] Failed to forward ask_user_question:', err);
                 });
               }
             } catch { /* skip */ }

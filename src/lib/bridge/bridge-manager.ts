@@ -15,6 +15,7 @@ import './adapters/index.js';
 import * as router from './channel-router.js';
 import * as engine from './conversation-engine.js';
 import * as broker from './permission-broker.js';
+import * as questionBroker from './question-broker.js';
 import { deliver, deliverRendered } from './delivery-layer.js';
 import { markdownToTelegramChunks } from './markdown/telegram.js';
 import { markdownToDiscordChunks } from './markdown/discord.js';
@@ -442,8 +443,16 @@ async function handleMessage(
     }
   };
 
-  // Handle callback queries (permission buttons)
+  // Handle callback queries (permission buttons or AskUserQuestion buttons)
   if (msg.callbackData) {
+    if (msg.callbackData.startsWith('auq:')) {
+      const handled = questionBroker.handleQuestionCallback(adapter, msg.callbackData, msg.address.chatId, msg.callbackMessageId);
+      if (handled) {
+        // No confirmation needed — the question broker handles state transitions
+      }
+      ack();
+      return;
+    }
     const handled = broker.handlePermissionCallback(msg.callbackData, msg.address.chatId, msg.callbackMessageId);
     if (handled) {
       // Send confirmation
@@ -460,6 +469,13 @@ async function handleMessage(
 
   const rawText = msg.text.trim();
   const hasAttachments = msg.attachments && msg.attachments.length > 0;
+
+  // Handle free-text answer for AskUserQuestion "Chat about this"
+  if (rawText && questionBroker.hasPendingQuestion(msg.address.chatId)) {
+    questionBroker.handleFreeTextAnswer(adapter, msg.address.chatId, rawText);
+    ack();
+    return;
+  }
 
   // Handle image-only download failures — surface error to user instead of silently dropping
   if (!rawText && !hasAttachments) {
@@ -594,7 +610,9 @@ async function handleMessage(
         perm.suggestions,
         msg.messageId,
       );
-    }, taskAbort.signal, hasAttachments ? msg.attachments : undefined, onPartialText);
+    }, taskAbort.signal, hasAttachments ? msg.attachments : undefined, onPartialText, async (auq) => {
+      await questionBroker.forwardAskUserQuestion(adapter, msg.address, auq);
+    });
 
     // Send response text — render via channel-appropriate format
     if (result.responseText) {

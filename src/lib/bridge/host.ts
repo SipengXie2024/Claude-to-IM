@@ -36,6 +36,7 @@ export type SSEEventType =
   | 'result'
   | 'error'
   | 'permission_request'
+  | 'ask_user_question'
   | 'thinking'
   | 'mode_changed'
   | 'task_update'
