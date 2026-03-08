@@ -138,6 +138,7 @@ export async function processMessage(
     switch (binding.mode) {
       case 'plan': permissionMode = 'plan'; break;
       case 'ask': permissionMode = 'default'; break;
+      case 'bypass': permissionMode = 'bypass'; break;
       default: permissionMode = 'acceptEdits'; break;
     }
 
@@ -186,6 +187,19 @@ export async function processMessage(
 }
 
 /**
+ * Format a brief tool description for the streaming preview.
+ * e.g. "Read: src/main.ts" or "Bash: git status"
+ */
+function formatToolBrief(name: string, input: Record<string, unknown>): string {
+  // Pick the most informative short argument
+  const arg = input.file_path || input.path || input.pattern || input.command || input.query || input.file || '';
+  const argStr = typeof arg === 'string' ? arg : JSON.stringify(arg);
+  // Truncate long args
+  const brief = argStr.length > 60 ? argStr.slice(0, 57) + '...' : argStr;
+  return brief ? `${name}: ${brief}` : name;
+}
+
+/**
  * Consume an SSE stream and extract response data.
  * Mirrors the collectStreamResponse() logic from chat/route.ts.
  */
@@ -199,8 +213,11 @@ async function consumeStream(
   const reader = stream.getReader();
   const contentBlocks: MessageContentBlock[] = [];
   let currentText = '';
-  /** Monotonically accumulated text for streaming preview — never resets on tool_use. */
-  let previewText = '';
+  /** Streaming preview lines — tool status + thinking indicator (text excluded). */
+  let previewLines: string[] = [];
+  let toolCounter = 0;
+  /** Map tool_use id → index in previewLines for status update on result. */
+  const toolLineIndex = new Map<string, number>();
   let tokenUsage: TokenUsage | null = null;
   let hasError = false;
   let errorMessage = '';
@@ -227,9 +244,14 @@ async function consumeStream(
         switch (event.type) {
           case 'text':
             currentText += event.data;
-            if (onPartialText) {
-              previewText += event.data;
-              try { onPartialText(previewText); } catch { /* non-critical */ }
+            // Text is NOT sent to streaming preview — only appears in final/intermediate messages
+            break;
+
+          case 'thinking':
+            // Show thinking indicator in preview
+            if (onPartialText && previewLines.length === 0) {
+              previewLines.push('🧠 Thinking...');
+              try { onPartialText(previewLines.join('\n')); } catch { /* non-critical */ }
             }
             break;
 
@@ -246,6 +268,15 @@ async function consumeStream(
                 name: toolData.name,
                 input: toolData.input,
               });
+              // Add tool status line to preview
+              if (onPartialText) {
+                toolCounter++;
+                const brief = formatToolBrief(toolData.name, toolData.input);
+                const line = `⏳ [${toolCounter}] ${brief}`;
+                toolLineIndex.set(toolData.id, previewLines.length);
+                previewLines.push(line);
+                try { onPartialText(previewLines.join('\n')); } catch { /* non-critical */ }
+              }
             } catch { /* skip */ }
             break;
           }
@@ -267,6 +298,15 @@ async function consumeStream(
               } else {
                 seenToolResultIds.add(resultData.tool_use_id);
                 contentBlocks.push(newBlock);
+              }
+              // Update preview: ⏳ → ✅ or ❌
+              if (onPartialText) {
+                const lineIdx = toolLineIndex.get(resultData.tool_use_id);
+                if (lineIdx !== undefined && lineIdx < previewLines.length) {
+                  const icon = resultData.is_error ? '❌' : '✅';
+                  previewLines[lineIdx] = previewLines[lineIdx].replace(/^⏳/, icon);
+                  try { onPartialText(previewLines.join('\n')); } catch { /* non-critical */ }
+                }
               }
             } catch { /* skip */ }
             break;
