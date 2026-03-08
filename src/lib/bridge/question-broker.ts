@@ -1,111 +1,212 @@
 /**
- * Question Broker — renders AskUserQuestion prompts as interactive TG messages
- * with inline buttons, handles single-select, multi-select, and free-text answers.
+ * Question Broker — handles AskUserQuestion interactive rendering for IM channels.
  *
- * Flow:
- * 1. forwardAskUserQuestion() sends a message with option buttons + "Chat about this"
- * 2. User clicks an option → handleQuestionCallback() records the answer
- *    - Single-select: immediately resolves (or advances to next question)
- *    - Multi-select: toggles selection, waits for "Done"
- *    - Chat: sets awaitingFreeText, next user message goes to handleFreeTextAnswer()
- * 3. When all questions answered → resolves via permissions gateway with updatedInput
- *
- * Callback data format: auq:{shortId}:{questionIndex}:{action}
- *   action = opt0, opt1, ... | chat | done | other (removed)
+ * When Claude calls AskUserQuestion, the broker:
+ * 1. Renders each question as a message with inline keyboard buttons
+ * 2. Tracks multi-select toggle state and free-text input
+ * 3. Collects answers and resolves the pending permission with updatedInput
  */
 
+import crypto from 'crypto';
 import type { ChannelAddress, OutboundMessage } from './types.js';
 import type { BaseChannelAdapter } from './channel-adapter.js';
+import type { AskUserQuestionInfo } from './conversation-engine.js';
 import { deliver } from './delivery-layer.js';
 import { getBridgeContext } from './context.js';
 import { escapeHtml } from './adapters/telegram-utils.js';
-import crypto from 'crypto';
-
-// ── Types ──
 
 interface QuestionOption {
   label: string;
   description?: string;
-  preview?: string;
 }
 
 interface Question {
   question: string;
   header?: string;
+  options?: QuestionOption[];
   multiSelect?: boolean;
-  options: QuestionOption[];
-}
-
-interface AskUserQuestionPayload {
-  toolUseID: string;
-  questions: Question[];
 }
 
 interface PendingQuestion {
   toolUseID: string;
   shortId: string;
   questions: Question[];
-  currentIndex: number;
   answers: Record<string, string>;
-  /** For multi-select: currently toggled option indices per question index */
+  currentQuestionIdx: number;
   multiSelectState: Map<number, Set<number>>;
+  awaitingFreeText: 'chat' | null;
   chatId: string;
-  adapter: BaseChannelAdapter;
-  address: ChannelAddress;
-  awaitingFreeText: boolean;
-  messageId?: string;
+  channelType: string;
+  messageIds: string[];
 }
 
-// ── State ──
-
-/** Map chatId → pending question state. Only one active question per chat. */
+/** Map from shortId to PendingQuestion */
 const pendingQuestions = new Map<string, PendingQuestion>();
-/** Map shortId → chatId for reverse lookup from callbacks */
-const shortIdToChat = new Map<string, string>();
-
-// ── Public API ──
+/** Map from chatId to shortId for free-text routing */
+const chatToPending = new Map<string, string>();
 
 /**
- * Forward an AskUserQuestion to the IM channel with interactive buttons.
- * If there's already a pending question in this chat, the old one is denied (superseded).
+ * Generate a 6-char short ID from a toolUseID for compact callback_data.
+ */
+function makeShortId(toolUseID: string): string {
+  const hex = crypto.createHash('sha256').update(toolUseID).digest('hex');
+  // Convert first 8 hex chars to base36 for a compact 6-char ID
+  return parseInt(hex.slice(0, 8), 16).toString(36).padStart(6, '0').slice(0, 6);
+}
+
+/**
+ * Render and send a single question as a message with inline buttons.
+ */
+async function sendQuestion(
+  adapter: BaseChannelAdapter,
+  address: ChannelAddress,
+  pq: PendingQuestion,
+  qIdx: number,
+): Promise<void> {
+  const q = pq.questions[qIdx];
+  const isMulti = q.multiSelect === true;
+
+  // Build message text
+  const lines: string[] = [];
+  if (q.header) {
+    lines.push(`<b>${escapeHtml(q.header)}</b>`);
+  }
+  lines.push(escapeHtml(q.question));
+  lines.push('');
+  lines.push(isMulti ? 'Select one or more:' : 'Choose one:');
+
+  const text = lines.join('\n');
+
+  // Build inline keyboard
+  const buttons: Array<Array<{ text: string; callbackData: string }>> = [];
+
+  if (q.options && q.options.length > 0) {
+    const selected = pq.multiSelectState.get(qIdx) || new Set<number>();
+    for (let i = 0; i < q.options.length; i++) {
+      const opt = q.options[i];
+      const prefix = isMulti ? (selected.has(i) ? '✅ ' : '') : '';
+      const label = opt.description
+        ? `${prefix}${opt.label} - ${opt.description}`
+        : `${prefix}${opt.label}`;
+      buttons.push([{ text: label, callbackData: `auq:${pq.shortId}:${qIdx}:opt${i}` }]);
+    }
+  }
+
+  buttons.push([{ text: '💬 Chat about this', callbackData: `auq:${pq.shortId}:${qIdx}:chat` }]);
+
+  if (isMulti) {
+    buttons.push([{ text: '✅ Done', callbackData: `auq:${pq.shortId}:${qIdx}:done` }]);
+  }
+
+  const message: OutboundMessage = {
+    address,
+    text,
+    parseMode: 'HTML',
+    inlineButtons: buttons,
+  };
+
+  const result = await deliver(adapter, message);
+  if (result.ok && result.messageId) {
+    pq.messageIds.push(result.messageId);
+  }
+}
+
+/**
+ * Advance to the next question or resolve all answers.
+ */
+function advanceOrResolve(pq: PendingQuestion, adapter: BaseChannelAdapter, address: ChannelAddress): void {
+  pq.currentQuestionIdx++;
+
+  if (pq.currentQuestionIdx >= pq.questions.length) {
+    // All questions answered — resolve
+    resolveAllQuestions(pq);
+  } else {
+    // Send next question
+    sendQuestion(adapter, address, pq, pq.currentQuestionIdx).catch((err) => {
+      console.error('[question-broker] Failed to send next question:', err);
+    });
+  }
+}
+
+/**
+ * Resolve the pending permission with collected answers.
+ */
+function resolveAllQuestions(pq: PendingQuestion): void {
+  const { permissions } = getBridgeContext();
+  pendingQuestions.delete(pq.shortId);
+  chatToPending.delete(pq.chatId);
+
+  permissions.resolvePendingPermission(pq.toolUseID, {
+    behavior: 'allow',
+    updatedInput: {
+      questions: pq.questions,
+      answers: pq.answers,
+    },
+  });
+}
+
+/**
+ * Resolve as deny (for "Chat about this" flow).
+ */
+function resolveAsDeny(pq: PendingQuestion, message: string): void {
+  const { permissions } = getBridgeContext();
+  pendingQuestions.delete(pq.shortId);
+  chatToPending.delete(pq.chatId);
+
+  permissions.resolvePendingPermission(pq.toolUseID, {
+    behavior: 'deny',
+    message,
+  });
+}
+
+// ── Public API ───────────────────────────────────────────────
+
+/**
+ * Forward an AskUserQuestion to the IM channel.
+ * Sends the first question immediately; subsequent questions are sent
+ * as the user answers each one.
  */
 export async function forwardAskUserQuestion(
   adapter: BaseChannelAdapter,
   address: ChannelAddress,
-  payload: AskUserQuestionPayload,
+  info: AskUserQuestionInfo,
 ): Promise<void> {
-  const chatId = address.chatId;
+  const shortId = makeShortId(info.toolUseID);
 
-  // Supersede any existing pending question in this chat
-  const existing = pendingQuestions.get(chatId);
-  if (existing) {
-    const { permissions } = getBridgeContext();
-    permissions.resolvePendingPermission(existing.toolUseID, {
-      behavior: 'deny',
-      message: 'Superseded by new question',
-    });
-    shortIdToChat.delete(existing.shortId);
-    pendingQuestions.delete(chatId);
+  // Cancel any existing question session for this chat
+  const existingShortId = chatToPending.get(address.chatId);
+  if (existingShortId) {
+    const existing = pendingQuestions.get(existingShortId);
+    if (existing) {
+      resolveAsDeny(existing, 'Superseded by new question');
+    }
   }
 
-  const shortId = crypto.randomBytes(3).toString('hex');
-  const state: PendingQuestion = {
-    toolUseID: payload.toolUseID,
+  const pq: PendingQuestion = {
+    toolUseID: info.toolUseID,
     shortId,
-    questions: payload.questions,
-    currentIndex: 0,
+    questions: info.questions as Question[],
     answers: {},
+    currentQuestionIdx: 0,
     multiSelectState: new Map(),
-    chatId,
-    adapter,
-    address,
-    awaitingFreeText: false,
+    awaitingFreeText: null,
+    chatId: address.chatId,
+    channelType: address.channelType,
+    messageIds: [],
   };
 
-  pendingQuestions.set(chatId, state);
-  shortIdToChat.set(shortId, chatId);
+  // Initialize multi-select state
+  for (let i = 0; i < pq.questions.length; i++) {
+    if (pq.questions[i].multiSelect) {
+      pq.multiSelectState.set(i, new Set());
+    }
+  }
 
-  await sendQuestion(state, 0);
+  pendingQuestions.set(shortId, pq);
+  chatToPending.set(address.chatId, shortId);
+
+  // Send the first question
+  await sendQuestion(adapter, address, pq, 0);
 }
 
 /**
@@ -115,229 +216,155 @@ export async function forwardAskUserQuestion(
 export function handleQuestionCallback(
   adapter: BaseChannelAdapter,
   callbackData: string,
-  callbackChatId: string,
+  chatId: string,
   callbackMessageId?: string,
 ): boolean {
-  // Parse: auq:{shortId}:{questionIndex}:{action}
+  // Parse: auq:<shortId>:<qIdx>:<action>
   const parts = callbackData.split(':');
   if (parts.length < 4 || parts[0] !== 'auq') return false;
 
   const shortId = parts[1];
-  const questionIndex = parseInt(parts[2], 10);
+  const qIdx = parseInt(parts[2], 10);
   const action = parts[3];
 
-  const chatId = shortIdToChat.get(shortId);
-  if (!chatId) return false;
+  const pq = pendingQuestions.get(shortId);
+  if (!pq) return false;
+  if (pq.chatId !== chatId) return false;
 
-  const state = pendingQuestions.get(chatId);
-  if (!state || state.shortId !== shortId) return false;
+  const q = pq.questions[qIdx];
+  if (!q) return false;
 
-  // Security: verify callback comes from the same chat
-  if (callbackChatId !== state.chatId) return false;
+  const address: ChannelAddress = {
+    channelType: pq.channelType,
+    chatId: pq.chatId,
+  };
 
-  const question = state.questions[questionIndex];
-  if (!question) return false;
+  if (action.startsWith('opt')) {
+    const optIdx = parseInt(action.slice(3), 10);
+    if (!q.options || optIdx >= q.options.length) return false;
+
+    if (q.multiSelect) {
+      // Toggle selection
+      const selected = pq.multiSelectState.get(qIdx) || new Set<number>();
+      if (selected.has(optIdx)) {
+        selected.delete(optIdx);
+      } else {
+        selected.add(optIdx);
+      }
+      pq.multiSelectState.set(qIdx, selected);
+
+      // Update buttons via editMessageReplyMarkup
+      editQuestionButtons(adapter, chatId, callbackMessageId, pq, qIdx);
+    } else {
+      // Single select — record answer and advance
+      pq.answers[q.question] = q.options[optIdx].label;
+      pq.awaitingFreeText = null;
+      advanceOrResolve(pq, adapter, address);
+    }
+    return true;
+  }
 
   if (action === 'chat') {
-    state.awaitingFreeText = true;
+    pq.awaitingFreeText = 'chat';
+    deliver(adapter, {
+      address,
+      text: 'Type your feedback for Claude:',
+      parseMode: 'plain',
+    }).catch(() => {});
     return true;
   }
 
   if (action === 'done') {
-    // Multi-select done
-    const selected = state.multiSelectState.get(questionIndex);
-    if (!selected || selected.size === 0) {
-      // Reject empty multi-select — send hint
+    if (!q.multiSelect) return false;
+    // Collect selected labels
+    const selected = pq.multiSelectState.get(qIdx) || new Set<number>();
+    if (selected.size === 0 && q.options && q.options.length > 0) {
+      // No selection — send hint
       deliver(adapter, {
-        address: state.address,
-        text: 'Please select at least one option before pressing Done.',
+        address,
+        text: 'Please select at least one option.',
         parseMode: 'plain',
       }).catch(() => {});
       return true;
     }
-
-    // Build comma-separated answer from selected options
-    const labels = [...selected]
-      .sort((a, b) => a - b)
-      .map(i => question.options[i]?.label)
-      .filter(Boolean);
-    state.answers[question.question] = labels.join(', ');
-
-    advanceOrResolve(state);
+    const labels = q.options
+      ? Array.from(selected).sort((a, b) => a - b).map(i => q.options![i].label)
+      : [];
+    pq.answers[q.question] = labels.join(', ');
+    pq.awaitingFreeText = null;
+    advanceOrResolve(pq, adapter, address);
     return true;
   }
 
-  // Option selection: optN
-  const optMatch = action.match(/^opt(\d+)$/);
-  if (!optMatch) return false;
-
-  const optIndex = parseInt(optMatch[1], 10);
-  if (optIndex >= question.options.length) return false;
-
-  if (question.multiSelect) {
-    // Toggle selection
-    if (!state.multiSelectState.has(questionIndex)) {
-      state.multiSelectState.set(questionIndex, new Set());
-    }
-    const selected = state.multiSelectState.get(questionIndex)!;
-    if (selected.has(optIndex)) {
-      selected.delete(optIndex);
-    } else {
-      selected.add(optIndex);
-    }
-    // Update button labels to show selection state
-    updateMultiSelectButtons(state, questionIndex);
-    return true;
-  }
-
-  // Single-select: record answer immediately
-  state.answers[question.question] = question.options[optIndex].label;
-  advanceOrResolve(state);
-  return true;
+  return false;
 }
 
 /**
- * Handle a free-text message as an answer to a "Chat about this" action.
+ * Handle free-text input for "Chat about this".
+ * Returns true if the text was consumed by a pending question.
  */
 export function handleFreeTextAnswer(
   adapter: BaseChannelAdapter,
   chatId: string,
   text: string,
-): void {
-  const state = pendingQuestions.get(chatId);
-  if (!state || !state.awaitingFreeText) return;
+): boolean {
+  const shortId = chatToPending.get(chatId);
+  if (!shortId) return false;
 
-  // Resolve as deny with user's feedback text
-  const { permissions } = getBridgeContext();
-  permissions.resolvePendingPermission(state.toolUseID, {
-    behavior: 'deny',
-    message: text,
-  });
+  const pq = pendingQuestions.get(shortId);
+  if (!pq || !pq.awaitingFreeText) return false;
 
-  cleanup(state);
+  if (pq.awaitingFreeText === 'chat') {
+    // Deny with user's feedback
+    resolveAsDeny(pq, text);
+    return true;
+  }
+
+  return false;
 }
 
 /**
- * Check if a chat has a pending question awaiting free-text input.
+ * Check if a chat has a pending AskUserQuestion session.
  */
 export function hasPendingQuestion(chatId: string): boolean {
-  const state = pendingQuestions.get(chatId);
-  return state?.awaitingFreeText === true;
+  const shortId = chatToPending.get(chatId);
+  if (!shortId) return false;
+  const pq = pendingQuestions.get(shortId);
+  return pq != null && pq.awaitingFreeText != null;
 }
 
-// ── Internal helpers ──
+/**
+ * Update inline keyboard buttons for a multi-select question (toggle checkboxes).
+ */
+function editQuestionButtons(
+  adapter: BaseChannelAdapter,
+  chatId: string,
+  messageId: string | undefined,
+  pq: PendingQuestion,
+  qIdx: number,
+): void {
+  if (!messageId) return;
+  if (!adapter.editMessageButtons) return;
 
-async function sendQuestion(state: PendingQuestion, index: number): Promise<void> {
-  state.currentIndex = index;
-  const question = state.questions[index];
+  const q = pq.questions[qIdx];
+  if (!q || !q.options) return;
 
-  // Build header
-  const header = question.header
-    ? `<b>${escapeHtml(question.header)}</b>\n\n`
-    : '';
-
-  // Build description lines for options
-  const optionDescriptions = question.options
-    .map((opt, i) => {
-      const desc = opt.description ? ` — ${opt.description}` : '';
-      return `${i + 1}. <b>${escapeHtml(opt.label)}</b>${escapeHtml(desc)}`;
-    })
-    .join('\n');
-
-  const text = `${header}${escapeHtml(question.question)}\n\n${optionDescriptions}`;
-
-  // Build inline buttons
+  const selected = pq.multiSelectState.get(qIdx) || new Set<number>();
   const buttons: Array<Array<{ text: string; callbackData: string }>> = [];
 
-  for (let i = 0; i < question.options.length; i++) {
-    buttons.push([{
-      text: question.options[i].label,
-      callbackData: `auq:${state.shortId}:${index}:opt${i}`,
-    }]);
+  for (let i = 0; i < q.options.length; i++) {
+    const opt = q.options[i];
+    const prefix = selected.has(i) ? '✅ ' : '';
+    const label = opt.description
+      ? `${prefix}${opt.label} - ${opt.description}`
+      : `${prefix}${opt.label}`;
+    buttons.push([{ text: label, callbackData: `auq:${pq.shortId}:${qIdx}:opt${i}` }]);
   }
 
-  // Chat about this button
-  buttons.push([{
-    text: '💬 Chat about this',
-    callbackData: `auq:${state.shortId}:${index}:chat`,
-  }]);
+  buttons.push([{ text: '💬 Chat about this', callbackData: `auq:${pq.shortId}:${qIdx}:chat` }]);
+  buttons.push([{ text: '✅ Done', callbackData: `auq:${pq.shortId}:${qIdx}:done` }]);
 
-  // Done button for multi-select
-  if (question.multiSelect) {
-    buttons.push([{
-      text: '✅ Done',
-      callbackData: `auq:${state.shortId}:${index}:done`,
-    }]);
-  }
-
-  const message: OutboundMessage = {
-    address: state.address,
-    text,
-    parseMode: 'HTML',
-    inlineButtons: buttons,
-  };
-
-  const result = await deliver(state.adapter, message);
-  if (result.ok && result.messageId) {
-    state.messageId = result.messageId;
-  }
-}
-
-function advanceOrResolve(state: PendingQuestion): void {
-  const nextIndex = state.currentIndex + 1;
-
-  if (nextIndex < state.questions.length) {
-    // Send next question
-    sendQuestion(state, nextIndex).catch((err) => {
-      console.error('[question-broker] Failed to send next question:', err);
-    });
-    return;
-  }
-
-  // All questions answered — resolve
-  const { permissions } = getBridgeContext();
-  permissions.resolvePendingPermission(state.toolUseID, {
-    behavior: 'allow',
-    updatedInput: {
-      questions: state.questions,
-      answers: state.answers,
-    },
+  adapter.editMessageButtons(chatId, messageId, buttons).catch((err) => {
+    console.error('[question-broker] Failed to edit buttons:', err);
   });
-
-  cleanup(state);
-}
-
-function updateMultiSelectButtons(state: PendingQuestion, questionIndex: number): void {
-  const question = state.questions[questionIndex];
-  const selected = state.multiSelectState.get(questionIndex) || new Set();
-
-  const buttons: Array<Array<{ text: string; callbackData: string }>> = [];
-
-  for (let i = 0; i < question.options.length; i++) {
-    const isSelected = selected.has(i);
-    buttons.push([{
-      text: `${isSelected ? '✅ ' : ''}${question.options[i].label}`,
-      callbackData: `auq:${state.shortId}:${questionIndex}:opt${i}`,
-    }]);
-  }
-
-  buttons.push([{
-    text: '💬 Chat about this',
-    callbackData: `auq:${state.shortId}:${questionIndex}:chat`,
-  }]);
-
-  buttons.push([{
-    text: '✅ Done',
-    callbackData: `auq:${state.shortId}:${questionIndex}:done`,
-  }]);
-
-  // Edit existing message buttons
-  if (state.messageId && state.adapter.editMessageButtons) {
-    state.adapter.editMessageButtons(state.chatId, state.messageId, buttons).catch(() => {});
-  }
-}
-
-function cleanup(state: PendingQuestion): void {
-  shortIdToChat.delete(state.shortId);
-  pendingQuestions.delete(state.chatId);
 }
