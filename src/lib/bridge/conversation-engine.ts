@@ -213,11 +213,11 @@ async function consumeStream(
   const reader = stream.getReader();
   const contentBlocks: MessageContentBlock[] = [];
   let currentText = '';
-  /** Streaming preview lines — tool status + thinking indicator (text excluded). */
-  let previewLines: string[] = [];
+  /** Streaming preview — only shows the current step (thinking or latest tool). */
+  let previewText = '';
   let toolCounter = 0;
-  /** Map tool_use id → index in previewLines for status update on result. */
-  const toolLineIndex = new Map<string, number>();
+  /** Map tool_use id → its formatted brief for status update on result. */
+  const toolBriefs = new Map<string, { counter: number; brief: string }>();
   let tokenUsage: TokenUsage | null = null;
   let hasError = false;
   let errorMessage = '';
@@ -249,9 +249,9 @@ async function consumeStream(
 
           case 'thinking':
             // Show thinking indicator in preview
-            if (onPartialText && previewLines.length === 0) {
-              previewLines.push('🧠 Thinking...');
-              try { onPartialText(previewLines.join('\n')); } catch { /* non-critical */ }
+            if (onPartialText) {
+              previewText = '🧠 Thinking...';
+              try { onPartialText(previewText); } catch { /* non-critical */ }
             }
             break;
 
@@ -268,14 +268,13 @@ async function consumeStream(
                 name: toolData.name,
                 input: toolData.input,
               });
-              // Add tool status line to preview
+              // Show only the current tool in preview
               if (onPartialText) {
                 toolCounter++;
                 const brief = formatToolBrief(toolData.name, toolData.input);
-                const line = `⏳ [${toolCounter}] ${brief}`;
-                toolLineIndex.set(toolData.id, previewLines.length);
-                previewLines.push(line);
-                try { onPartialText(previewLines.join('\n')); } catch { /* non-critical */ }
+                toolBriefs.set(toolData.id, { counter: toolCounter, brief });
+                previewText = `⏳ [${toolCounter}] ${brief}`;
+                try { onPartialText(previewText); } catch { /* non-critical */ }
               }
             } catch { /* skip */ }
             break;
@@ -299,13 +298,13 @@ async function consumeStream(
                 seenToolResultIds.add(resultData.tool_use_id);
                 contentBlocks.push(newBlock);
               }
-              // Update preview: ⏳ → ✅ or ❌
+              // Update preview: ⏳ → ✅ or ❌ (only if this is the currently displayed tool)
               if (onPartialText) {
-                const lineIdx = toolLineIndex.get(resultData.tool_use_id);
-                if (lineIdx !== undefined && lineIdx < previewLines.length) {
+                const info = toolBriefs.get(resultData.tool_use_id);
+                if (info) {
                   const icon = resultData.is_error ? '❌' : '✅';
-                  previewLines[lineIdx] = previewLines[lineIdx].replace(/^⏳/, icon);
-                  try { onPartialText(previewLines.join('\n')); } catch { /* non-critical */ }
+                  previewText = `${icon} [${info.counter}] ${info.brief}`;
+                  try { onPartialText(previewText); } catch { /* non-critical */ }
                 }
               }
             } catch { /* skip */ }
