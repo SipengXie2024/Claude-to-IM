@@ -7,6 +7,9 @@
  * Uses globalThis to survive Next.js HMR in development.
  */
 
+import fs from 'node:fs';
+import path from 'node:path';
+
 import type { BridgeStatus, InboundMessage, OutboundMessage, StreamingPreviewState } from './types.js';
 import { createAdapter, getRegisteredTypes } from './channel-adapter.js';
 import type { BaseChannelAdapter } from './channel-adapter.js';
@@ -23,11 +26,108 @@ import { getBridgeContext } from './context.js';
 import { escapeHtml } from './adapters/telegram-utils.js';
 import {
   validateWorkingDirectory,
-  validateSessionId,
   isDangerousInput,
   sanitizeInput,
   validateMode,
 } from './security/validators.js';
+
+// ── Claude Code session discovery ──────────────────────────────
+
+interface ClaudeCodeSession {
+  sessionId: string;
+  timestamp: string;
+  firstMessage: string;
+}
+
+/**
+ * Encode a directory path into Claude Code's project directory name.
+ * e.g. /home/ubuntu/sipeng → -home-ubuntu-sipeng
+ */
+function encodeProjectPath(cwd: string): string {
+  return cwd.replace(/\//g, '-');
+}
+
+/** Cached session lists with TTL to avoid repeated FS reads on rapid /sessions calls. */
+let sessionListCache: { key: string; result: ClaudeCodeSession[]; expiry: number } | null = null;
+const SESSION_LIST_CACHE_TTL_MS = 10_000;
+
+/**
+ * Scan Claude Code's session storage for a given working directory.
+ * Results are cached for 10s. Returns sessions sorted by timestamp (newest first).
+ */
+function listClaudeCodeSessions(cwd: string): ClaudeCodeSession[] {
+  const cacheKey = cwd;
+  if (sessionListCache && sessionListCache.key === cacheKey && Date.now() < sessionListCache.expiry) {
+    return sessionListCache.result;
+  }
+  const homeDir = process.env.HOME || '/root';
+  const projectDir = path.join(homeDir, '.claude', 'projects', encodeProjectPath(cwd));
+
+  let files: string[];
+  try {
+    files = fs.readdirSync(projectDir).filter(f => f.endsWith('.jsonl'));
+  } catch {
+    return [];
+  }
+
+  const sessions: ClaudeCodeSession[] = [];
+  for (const file of files) {
+    const sessionId = file.replace('.jsonl', '');
+    const filePath = path.join(projectDir, file);
+    let timestamp = '';
+    let firstMessage = '';
+
+    try {
+      // Read only the first few KB to extract metadata
+      const fd = fs.openSync(filePath, 'r');
+      const buf = Buffer.alloc(8192);
+      const bytesRead = fs.readSync(fd, buf, 0, 8192, 0);
+      fs.closeSync(fd);
+      const chunk = buf.toString('utf-8', 0, bytesRead);
+
+      for (const line of chunk.split('\n')) {
+        if (!line.trim()) continue;
+        try {
+          const obj = JSON.parse(line);
+          if (!timestamp && obj.timestamp) {
+            timestamp = obj.timestamp;
+          }
+          if (!firstMessage && obj.type === 'user' && obj.message?.content) {
+            const content = obj.message.content;
+            if (typeof content === 'string' && !content.startsWith('<local-command')) {
+              firstMessage = content.slice(0, 60);
+            } else if (Array.isArray(content)) {
+              for (const block of content) {
+                if (block?.type === 'text' && !block.text?.startsWith('<local-command')) {
+                  firstMessage = block.text.slice(0, 60);
+                  break;
+                }
+              }
+            }
+          }
+          if (timestamp && firstMessage) break;
+        } catch { /* skip malformed line */ }
+      }
+    } catch { /* skip unreadable file */ }
+
+    sessions.push({ sessionId, timestamp, firstMessage });
+  }
+
+  // Sort newest first
+  sessions.sort((a, b) => (b.timestamp || '').localeCompare(a.timestamp || ''));
+  sessionListCache = { key: cacheKey, result: sessions, expiry: Date.now() + SESSION_LIST_CACHE_TTL_MS };
+  return sessions;
+}
+
+/**
+ * Find Claude Code sessions matching a prefix.
+ * Searches in the project directory for the given cwd.
+ */
+function findSessionsByPrefix(cwd: string, prefix: string): ClaudeCodeSession[] {
+  const all = listClaudeCodeSessions(cwd);
+  const lower = prefix.toLowerCase();
+  return all.filter(s => s.sessionId.toLowerCase().startsWith(lower));
+}
 
 const GLOBAL_KEY = '__bridge_manager__';
 
@@ -188,6 +288,19 @@ function getState(): BridgeManagerState {
 }
 
 /**
+ * Abort the active task for a session, if one exists.
+ * Returns true if a task was actually aborted.
+ */
+function abortActiveTask(sessionId: string): boolean {
+  const st = getState();
+  const taskAbort = st.activeTasks.get(sessionId);
+  if (!taskAbort) return false;
+  taskAbort.abort();
+  st.activeTasks.delete(sessionId);
+  return true;
+}
+
+/**
  * Process a function with per-session serialization.
  * Different sessions run concurrently; same-session requests are serialized.
  */
@@ -274,6 +387,49 @@ export async function start(): Promise<void> {
   }
 
   console.log(`[bridge-manager] Bridge started with ${startedCount} adapter(s)`);
+}
+
+/**
+ * Drain the bridge: stop accepting new messages and wait for active tasks
+ * to complete (up to timeoutMs). Does NOT stop adapters — call stop() after.
+ *
+ * Returns true if all tasks finished within the timeout, false if timed out.
+ */
+export async function drain(timeoutMs = 30_000): Promise<boolean> {
+  const state = getState();
+  if (!state.running) return true;
+
+  // Stop accepting new messages (runAdapterLoop while-condition checks this)
+  state.running = false;
+
+  // Abort all event loops so adapters stop consuming
+  for (const [, abort] of state.loopAborts) {
+    abort.abort();
+  }
+  state.loopAborts.clear();
+
+  console.log(`[bridge-manager] Draining: ${state.activeTasks.size} active task(s), timeout ${timeoutMs}ms`);
+
+  if (state.activeTasks.size === 0) return true;
+
+  // Poll for active tasks to complete
+  const deadline = Date.now() + timeoutMs;
+  while (state.activeTasks.size > 0 && Date.now() < deadline) {
+    await new Promise(r => setTimeout(r, 500));
+  }
+
+  if (state.activeTasks.size > 0) {
+    console.warn(`[bridge-manager] Drain timeout: ${state.activeTasks.size} task(s) still active, aborting`);
+    for (const [sid, abort] of state.activeTasks) {
+      abort.abort();
+      console.warn(`[bridge-manager]   Aborted task for session ${sid.slice(0, 8)}...`);
+    }
+    state.activeTasks.clear();
+    return false;
+  }
+
+  console.log('[bridge-manager] Drain complete: all tasks finished');
+  return true;
 }
 
 /**
@@ -462,6 +618,20 @@ async function handleMessage(
         parseMode: 'plain',
       };
       await deliver(adapter, confirmMsg);
+
+      // If the user denied, also abort the running task (same as Claude Code behavior).
+      if (msg.callbackData.startsWith('perm:deny:')) {
+        const binding = router.resolve(msg.address);
+        abortActiveTask(binding.codepilotSessionId);
+      }
+    } else {
+      // Inform the user that the permission request is no longer valid
+      const errorMsg: OutboundMessage = {
+        address: msg.address,
+        text: 'Permission request expired or already resolved.',
+        parseMode: 'plain',
+      };
+      await deliver(adapter, errorMsg);
     }
     ack();
     return;
@@ -599,24 +769,36 @@ async function handleMessage(
     // Use text or empty string for image-only messages (prompt is still required by streamClaude)
     const promptText = text || (hasAttachments ? 'Describe this image.' : '');
 
-    const result = await engine.processMessage(binding, promptText, async (perm) => {
-      await broker.forwardPermissionRequest(
-        adapter,
-        msg.address,
-        perm.permissionRequestId,
-        perm.toolName,
-        perm.toolInput,
-        binding.codepilotSessionId,
-        perm.suggestions,
-        msg.messageId,
-      );
-    }, taskAbort.signal, hasAttachments ? msg.attachments : undefined, onPartialText, async (auq) => {
-      await questionBroker.forwardAskUserQuestion(adapter, msg.address, auq as Parameters<typeof questionBroker.forwardAskUserQuestion>[2]);
+    const result = await engine.processMessage(binding, promptText, {
+      onPermissionRequest: async (perm) => {
+        await broker.forwardPermissionRequest(
+          adapter,
+          msg.address,
+          perm.permissionRequestId,
+          perm.toolName,
+          perm.toolInput,
+          binding.codepilotSessionId,
+          perm.suggestions,
+          msg.messageId,
+        );
+      },
+      abortSignal: taskAbort.signal,
+      files: hasAttachments ? msg.attachments : undefined,
+      onPartialText,
+      onAskUserQuestion: async (auq) => {
+        await questionBroker.forwardAskUserQuestion(adapter, msg.address, auq as Parameters<typeof questionBroker.forwardAskUserQuestion>[2]);
+      },
+      onIntermediateText: async (intermediateText) => {
+        await deliverResponse(adapter, msg.address, intermediateText, binding.codepilotSessionId, msg.messageId);
+      },
     });
 
     // Send response text — render via channel-appropriate format
-    if (result.responseText) {
-      await deliverResponse(adapter, msg.address, result.responseText, binding.codepilotSessionId, msg.messageId);
+    // Each text block (split at tool-use boundaries) is delivered as a separate message.
+    if (result.responseTexts.length > 0) {
+      for (const block of result.responseTexts) {
+        await deliverResponse(adapter, msg.address, block, binding.codepilotSessionId, msg.messageId);
+      }
     } else if (result.hasError) {
       const errorResponse: OutboundMessage = {
         address: msg.address,
@@ -731,18 +913,36 @@ async function handleCommand(
 
     case '/bind': {
       if (!args) {
-        response = 'Usage: /bind &lt;session_id&gt;';
+        response = 'Usage: /bind &lt;id_prefix&gt;';
         break;
       }
-      if (!validateSessionId(args)) {
-        response = 'Invalid session ID format. Expected a 32-64 character hex/UUID string.';
+      const prefix = args.trim().toLowerCase();
+      if (!/^[0-9a-f-]{2,}$/i.test(prefix)) {
+        response = 'Invalid session ID prefix. Use hex characters (e.g. <code>b79d</code>).';
         break;
       }
-      const binding = router.bindToSession(msg.address, args);
-      if (binding) {
-        response = `Bound to session <code>${args.slice(0, 8)}...</code>`;
+
+      // Search Claude Code sessions for the current cwd
+      const currentBinding = router.resolve(msg.address);
+      const cwd = currentBinding.workingDirectory || '';
+      const matches = findSessionsByPrefix(cwd, prefix);
+
+      if (matches.length === 0) {
+        response = `No session matching <code>${escapeHtml(prefix)}</code> in ${escapeHtml(cwd || '~')}`;
+      } else if (matches.length > 1) {
+        const lines = [`Multiple matches for <code>${escapeHtml(prefix)}</code>:`, ''];
+        for (const m of matches.slice(0, 5)) {
+          const preview = m.firstMessage ? ` "${escapeHtml(m.firstMessage)}"` : '';
+          lines.push(`<code>${m.sessionId.slice(0, 8)}</code>${preview}`);
+        }
+        lines.push('', 'Use a longer prefix to disambiguate.');
+        response = lines.join('\n');
       } else {
-        response = 'Session not found.';
+        // Exact single match — bind by setting sdkSessionId
+        const matched = matches[0];
+        router.updateBinding(currentBinding.id, { sdkSessionId: matched.sessionId });
+        const preview = matched.firstMessage ? `\n"${escapeHtml(matched.firstMessage)}"` : '';
+        response = `Bound to <code>${matched.sessionId.slice(0, 8)}...</code>${preview}`;
       }
       break;
     }
@@ -788,15 +988,33 @@ async function handleCommand(
     }
 
     case '/sessions': {
-      const bindings = router.listBindings(adapter.channelType);
-      if (bindings.length === 0) {
-        response = 'No sessions found.';
+      const binding = router.resolve(msg.address);
+      const cwd = binding.workingDirectory || '';
+      const ccSessions = listClaudeCodeSessions(cwd);
+
+      if (ccSessions.length === 0) {
+        response = `No sessions found for <code>${escapeHtml(cwd || '~')}</code>`;
       } else {
-        const lines = ['<b>Sessions:</b>', ''];
-        for (const b of bindings.slice(0, 10)) {
-          const active = b.active ? 'active' : 'inactive';
-          lines.push(`<code>${b.codepilotSessionId.slice(0, 8)}...</code> [${active}] ${escapeHtml(b.workingDirectory || '~')}`);
+        const currentSdk = binding.sdkSessionId || '';
+        const lines = [
+          `<b>Sessions</b> (${escapeHtml(cwd || '~')}):`,
+          '',
+        ];
+        for (const s of ccSessions.slice(0, 15)) {
+          const isActive = currentSdk && s.sessionId === currentSdk;
+          const marker = isActive ? ' ✦' : '';
+          const ts = s.timestamp ? s.timestamp.slice(5, 16).replace('T', ' ') : '?';
+          const preview = s.firstMessage
+            ? ` "${escapeHtml(s.firstMessage)}"`
+            : '';
+          lines.push(
+            `<code>${s.sessionId.slice(0, 8)}</code> [${ts}]${preview}${marker}`,
+          );
         }
+        if (ccSessions.length > 15) {
+          lines.push(`... and ${ccSessions.length - 15} more`);
+        }
+        lines.push('', '/bind &lt;id_prefix&gt; to switch');
         response = lines.join('\n');
       }
       break;
@@ -804,15 +1022,9 @@ async function handleCommand(
 
     case '/stop': {
       const binding = router.resolve(msg.address);
-      const st = getState();
-      const taskAbort = st.activeTasks.get(binding.codepilotSessionId);
-      if (taskAbort) {
-        taskAbort.abort();
-        st.activeTasks.delete(binding.codepilotSessionId);
-        response = 'Stopping current task...';
-      } else {
-        response = 'No task is currently running.';
-      }
+      response = abortActiveTask(binding.codepilotSessionId)
+        ? 'Stopping current task...'
+        : 'No task is currently running.';
       break;
     }
 
@@ -830,6 +1042,13 @@ async function handleCommand(
       const handled = broker.handlePermissionCallback(callbackData, msg.address.chatId);
       if (handled) {
         response = `Permission ${permAction}: recorded.`;
+        // Deny also stops the task (same as Claude Code behavior)
+        if (permAction === 'deny') {
+          const binding = router.resolve(msg.address);
+          if (abortActiveTask(binding.codepilotSessionId)) {
+            response += ' Task stopped.';
+          }
+        }
       } else {
         response = `Permission not found or already resolved.`;
       }

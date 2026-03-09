@@ -147,7 +147,8 @@ async function main() {
   const result = await engine.processMessage(binding, 'Hello, Claude!');
 
   console.log(`\nResult:`);
-  console.log(`  Response: "${result.responseText}"`);
+  console.log(`  Responses (${result.responseTexts.length} block(s)):`);
+  for (const t of result.responseTexts) console.log(`    "${t}"`);
   console.log(`  Has error: ${result.hasError}`);
   console.log(`  Token usage: ${JSON.stringify(result.tokenUsage)}`);
 

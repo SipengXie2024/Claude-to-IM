@@ -238,6 +238,25 @@ function isDaemonLifecycleCommand(input: Record<string, unknown>): boolean {
   return false;
 }
 
+// ── Claude2IM system prompt ──
+
+/**
+ * Appended to Claude Code's default system prompt so the LLM is aware
+ * it is running inside the Claude2IM bridge, not a terminal.
+ */
+const CLAUDE2IM_SYSTEM_PROMPT_APPEND = `
+You are running inside Claude2IM, a bridge that connects Claude Code to instant messaging platforms (Telegram, Discord, Feishu, QQ).
+
+Key context about your environment:
+- You are NOT in a terminal. The user is interacting with you through an IM app.
+- Your responses are rendered as IM messages with platform-specific formatting. Keep responses concise when possible — very long outputs are harder to read in IM.
+- Interactive terminal tools (AskUserQuestion) appear as inline buttons or prompts in the IM interface. They may time out if the user doesn't respond promptly.
+- Permission requests for tool usage also appear as IM buttons — the user taps Allow/Deny in their chat app.
+- NEVER attempt to stop, restart, or kill the daemon process (e.g. daemon.sh stop, kill the bridge PID, systemctl stop). This would terminate your own session and break the conversation.
+- If the daemon is gracefully restarted (SIGUSR2), your session can be resumed automatically via sdkSessionId on the next message.
+- The user may be on a mobile device with limited screen space. Prefer structured, scannable responses over walls of text.
+`.trim();
+
 // ── Plugin discovery ──
 
 /** Cached plugin list with TTL to avoid per-message filesystem reads. */
@@ -327,6 +346,12 @@ export class SDKLLMProvider implements LLMProvider {
               permissionMode: (isBypass ? 'acceptEdits' : params.permissionMode as 'default' | 'acceptEdits' | 'plan') || undefined,
               includePartialMessages: true,
               env: cleanEnv,
+              // Inject Claude2IM context so the LLM knows it's in an IM bridge
+              systemPrompt: {
+                type: 'preset',
+                preset: 'claude_code',
+                append: CLAUDE2IM_SYSTEM_PROMPT_APPEND,
+              },
               canUseTool: async (
                   toolName: string,
                   input: Record<string, unknown>,

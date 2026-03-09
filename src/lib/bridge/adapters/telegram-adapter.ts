@@ -677,10 +677,13 @@ export class TelegramAdapter extends BaseChannelAdapter {
               updateId: update.update_id,
             };
 
-            this.enqueue(msg);
+            // Answer callback FIRST to dismiss the loading state immediately,
+            // so the user gets instant visual feedback that their click was received.
+            await this.answerCallback(cb.id).catch((err) => {
+              console.warn('[telegram-adapter] Failed to answer callback query:', err);
+            });
 
-            // Answer callback to dismiss the loading state
-            this.answerCallback(cb.id).catch(() => {});
+            this.enqueue(msg);
           } else if (update.message) {
             const m = update.message;
             const chatId = String(m.chat.id);

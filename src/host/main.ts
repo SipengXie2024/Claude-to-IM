@@ -147,6 +147,33 @@ async function main(): Promise<void> {
   process.on('SIGINT', () => shutdown('SIGINT'));
   process.on('SIGHUP', () => shutdown('SIGHUP'));
 
+  // ── Graceful restart (SIGUSR2) ──
+  // Drains active tasks before exiting, so the supervisor can restart
+  // the process without interrupting in-flight Claude responses.
+  // Usage: kill -USR2 <pid>
+  process.on('SIGUSR2', () => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    console.log('[claude-to-im] SIGUSR2 received — graceful restart initiated');
+    writeStatus({ running: true, lastExitReason: 'graceful-restart: draining' });
+
+    (async () => {
+      const drained = await bridgeManager.drain(30_000);
+      pendingPerms.denyAll();
+      await bridgeManager.stop();
+      const reason = drained
+        ? 'graceful-restart: drained'
+        : 'graceful-restart: drain-timeout';
+      writeStatus({ running: false, lastExitReason: reason });
+      console.log(`[claude-to-im] Graceful restart exit (${reason})`);
+      process.exit(0);
+    })().catch((err) => {
+      console.error('[claude-to-im] Error during graceful restart:', err);
+      writeStatus({ running: false, lastExitReason: `graceful-restart: error: ${err instanceof Error ? err.message : String(err)}` });
+      process.exit(1);
+    });
+  });
+
   // ── Exit diagnostics ──
   process.on('unhandledRejection', (reason) => {
     console.error('[claude-to-im] unhandledRejection:', reason instanceof Error ? reason.stack || reason.message : reason);

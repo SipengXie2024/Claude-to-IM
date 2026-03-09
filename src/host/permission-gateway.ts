@@ -13,24 +13,18 @@ export interface PermissionResolution {
 export class PendingPermissions {
   private pending = new Map<string, {
     resolve: (r: PermissionResult) => void;
-    timer: NodeJS.Timeout;
   }>();
-  private timeoutMs = 5 * 60 * 1000; // 5 minutes
 
+  /** Wait indefinitely for user to respond (same as Claude Code behavior). */
   waitFor(toolUseID: string): Promise<PermissionResult> {
     return new Promise((resolve) => {
-      const timer = setTimeout(() => {
-        this.pending.delete(toolUseID);
-        resolve({ behavior: 'deny', message: 'Permission request timed out' });
-      }, this.timeoutMs);
-      this.pending.set(toolUseID, { resolve, timer });
+      this.pending.set(toolUseID, { resolve });
     });
   }
 
   resolve(permissionRequestId: string, resolution: PermissionResolution): boolean {
     const entry = this.pending.get(permissionRequestId);
     if (!entry) return false;
-    clearTimeout(entry.timer);
     if (resolution.behavior === 'allow') {
       entry.resolve({ behavior: 'allow', updatedInput: resolution.updatedInput });
     } else {
@@ -42,7 +36,6 @@ export class PendingPermissions {
 
   denyAll(): void {
     for (const [, entry] of this.pending) {
-      clearTimeout(entry.timer);
       entry.resolve({ behavior: 'deny', message: 'Bridge shutting down' });
     }
     this.pending.clear();

@@ -39,6 +39,13 @@ export type OnPermissionRequest = (perm: PermissionRequestInfo) => Promise<void>
  */
 export type OnPartialText = (fullText: string) => void;
 
+/**
+ * Callback invoked when a text block is flushed at a tool-use boundary.
+ * This allows intermediate text to be delivered as a separate IM message
+ * immediately, instead of waiting for the entire stream to finish.
+ */
+export type OnIntermediateText = (text: string) => Promise<void>;
+
 export interface AskUserQuestionInfo {
   toolUseID: string;
   questions: unknown[];
@@ -51,7 +58,8 @@ export interface AskUserQuestionInfo {
 export type OnAskUserQuestion = (info: AskUserQuestionInfo) => Promise<void>;
 
 export interface ConversationResult {
-  responseText: string;
+  /** Each text block from the assistant turn, in order (split at tool-use boundaries). */
+  responseTexts: string[];
   tokenUsage: TokenUsage | null;
   hasError: boolean;
   errorMessage: string;
@@ -61,6 +69,16 @@ export interface ConversationResult {
   sdkSessionId: string | null;
 }
 
+/** Options for processMessage — groups optional callbacks and inputs. */
+export interface ProcessMessageOptions {
+  onPermissionRequest?: OnPermissionRequest;
+  abortSignal?: AbortSignal;
+  files?: FileAttachment[];
+  onPartialText?: OnPartialText;
+  onAskUserQuestion?: OnAskUserQuestion;
+  onIntermediateText?: OnIntermediateText;
+}
+
 /**
  * Process an inbound message: send to Claude, consume the response stream,
  * save to DB, and return the result.
@@ -68,12 +86,12 @@ export interface ConversationResult {
 export async function processMessage(
   binding: ChannelBinding,
   text: string,
-  onPermissionRequest?: OnPermissionRequest,
-  abortSignal?: AbortSignal,
-  files?: FileAttachment[],
-  onPartialText?: OnPartialText,
-  onAskUserQuestion?: OnAskUserQuestion,
+  opts: ProcessMessageOptions = {},
 ): Promise<ConversationResult> {
+  const {
+    onPermissionRequest, abortSignal, files,
+    onPartialText, onAskUserQuestion, onIntermediateText,
+  } = opts;
   const { store, llm } = getBridgeContext();
   const sessionId = binding.codepilotSessionId;
 
@@ -82,7 +100,7 @@ export async function processMessage(
   const lockAcquired = store.acquireSessionLock(sessionId, lockId, `bridge-${binding.channelType}`, 600);
   if (!lockAcquired) {
     return {
-      responseText: '',
+      responseTexts: [],
       tokenUsage: null,
       hasError: true,
       errorMessage: 'Session is busy processing another request',
@@ -190,7 +208,7 @@ export async function processMessage(
     // Consume the stream server-side (replicate collectStreamResponse pattern).
     // Permission requests are forwarded immediately via the callback during streaming
     // because the stream blocks until permission is resolved — we can't wait until after.
-    return await consumeStream(stream, sessionId, onPermissionRequest, onPartialText, onAskUserQuestion);
+    return await consumeStream(stream, sessionId, onPermissionRequest, onPartialText, onAskUserQuestion, onIntermediateText);
   } finally {
     clearInterval(renewalInterval);
     store.releaseSessionLock(sessionId, lockId);
@@ -221,6 +239,7 @@ async function consumeStream(
   onPermissionRequest?: OnPermissionRequest,
   onPartialText?: OnPartialText,
   onAskUserQuestion?: OnAskUserQuestion,
+  onIntermediateText?: OnIntermediateText,
 ): Promise<ConversationResult> {
   const { store } = getBridgeContext();
   const reader = stream.getReader();
@@ -237,6 +256,8 @@ async function consumeStream(
   const seenToolResultIds = new Set<string>();
   const permissionRequests: PermissionRequestInfo[] = [];
   let capturedSdkSessionId: string | null = null;
+  /** Number of text blocks already delivered via onIntermediateText. */
+  let intermediateTextCount = 0;
 
   try {
     while (true) {
@@ -270,8 +291,17 @@ async function consumeStream(
 
           case 'tool_use': {
             if (currentText.trim()) {
+              const flushedText = currentText.trim();
               contentBlocks.push({ type: 'text', text: currentText });
               currentText = '';
+              // Deliver intermediate text immediately so it appears as a separate
+              // IM message before the tool starts executing.
+              if (onIntermediateText) {
+                intermediateTextCount++;
+                onIntermediateText(flushedText).catch((err) => {
+                  console.error('[conversation-engine] Failed to deliver intermediate text:', err);
+                });
+              }
             }
             try {
               const toolData = JSON.parse(event.data);
@@ -432,15 +462,16 @@ async function consumeStream(
       }
     }
 
-    // Extract text-only response for IM delivery
-    const responseText = contentBlocks
+    // Extract text-only blocks for IM delivery (one per tool-use boundary).
+    // Skip blocks already delivered via onIntermediateText during streaming.
+    const allTexts = contentBlocks
       .filter((b): b is Extract<MessageContentBlock, { type: 'text' }> => b.type === 'text')
-      .map((b) => b.text)
-      .join('')
-      .trim();
+      .map((b) => b.text.trim())
+      .filter((t) => t.length > 0);
+    const responseTexts = allTexts.slice(intermediateTextCount);
 
     return {
-      responseText,
+      responseTexts,
       tokenUsage,
       hasError,
       errorMessage,
@@ -472,7 +503,7 @@ async function consumeStream(
       || e instanceof Error && e.name === 'AbortError';
 
     return {
-      responseText: '',
+      responseTexts: [],
       tokenUsage,
       hasError: true,
       errorMessage: isAbort ? 'Task stopped by user' : (e instanceof Error ? e.message : 'Stream consumption error'),
