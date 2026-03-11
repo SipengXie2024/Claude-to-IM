@@ -34,7 +34,6 @@ interface PendingQuestion {
   answers: Record<string, string>;
   currentQuestionIdx: number;
   multiSelectState: Map<number, Set<number>>;
-  awaitingFreeText: 'chat' | null;
   chatId: string;
   channelType: string;
   messageIds: string[];
@@ -42,7 +41,7 @@ interface PendingQuestion {
 
 /** Map from shortId to PendingQuestion */
 const pendingQuestions = new Map<string, PendingQuestion>();
-/** Map from chatId to shortId for free-text routing */
+/** Map from chatId to shortId for supersede-on-new-question cleanup */
 const chatToPending = new Map<string, string>();
 
 /**
@@ -189,7 +188,6 @@ export async function forwardAskUserQuestion(
     answers: {},
     currentQuestionIdx: 0,
     multiSelectState: new Map(),
-    awaitingFreeText: null,
     chatId: address.chatId,
     channelType: address.channelType,
     messageIds: [],
@@ -258,19 +256,16 @@ export function handleQuestionCallback(
     } else {
       // Single select — record answer and advance
       pq.answers[q.question] = q.options[optIdx].label;
-      pq.awaitingFreeText = null;
       advanceOrResolve(pq, adapter, address);
     }
     return true;
   }
 
   if (action === 'chat') {
-    pq.awaitingFreeText = 'chat';
-    deliver(adapter, {
-      address,
-      text: 'Type your feedback for Claude:',
-      parseMode: 'plain',
-    }).catch(() => {});
+    // Immediately deny with clarification message (matches official Claude Code CLI behavior).
+    // Claude will receive this as a rejection with context and respond conversationally.
+    const clarification = buildClarificationMessage(pq);
+    resolveAsDeny(pq, clarification);
     return true;
   }
 
@@ -291,7 +286,6 @@ export function handleQuestionCallback(
       ? Array.from(selected).sort((a, b) => a - b).map(i => q.options![i].label)
       : [];
     pq.answers[q.question] = labels.join(', ');
-    pq.awaitingFreeText = null;
     advanceOrResolve(pq, adapter, address);
     return true;
   }
@@ -300,37 +294,26 @@ export function handleQuestionCallback(
 }
 
 /**
- * Handle free-text input for "Chat about this".
- * Returns true if the text was consumed by a pending question.
+ * Build a clarification message matching official Claude Code CLI behavior.
+ * Includes the questions asked and any answers already provided.
  */
-export function handleFreeTextAnswer(
-  adapter: BaseChannelAdapter,
-  chatId: string,
-  text: string,
-): boolean {
-  const shortId = chatToPending.get(chatId);
-  if (!shortId) return false;
-
-  const pq = pendingQuestions.get(shortId);
-  if (!pq || !pq.awaitingFreeText) return false;
-
-  if (pq.awaitingFreeText === 'chat') {
-    // Deny with user's feedback
-    resolveAsDeny(pq, text);
-    return true;
+function buildClarificationMessage(pq: PendingQuestion): string {
+  const lines: string[] = [
+    'The user wants to clarify these questions.',
+    'This means they may have additional information, context or questions for you.',
+    'Take their response into account and then reformulate the questions if appropriate.',
+    'Start by asking them what they would like to clarify.',
+    'Questions asked:',
+  ];
+  for (const q of pq.questions) {
+    const answer = pq.answers[q.question];
+    if (answer) {
+      lines.push(`- "${q.question}"\n  Answer: ${answer}`);
+    } else {
+      lines.push(`- "${q.question}"\n  (No answer provided)`);
+    }
   }
-
-  return false;
-}
-
-/**
- * Check if a chat has a pending AskUserQuestion session.
- */
-export function hasPendingQuestion(chatId: string): boolean {
-  const shortId = chatToPending.get(chatId);
-  if (!shortId) return false;
-  const pq = pendingQuestions.get(shortId);
-  return pq != null && pq.awaitingFreeText != null;
+  return lines.join('\n');
 }
 
 /**

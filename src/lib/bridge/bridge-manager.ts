@@ -640,13 +640,6 @@ async function handleMessage(
   const rawText = msg.text.trim();
   const hasAttachments = msg.attachments && msg.attachments.length > 0;
 
-  // Handle free-text answer for AskUserQuestion "Chat about this"
-  if (rawText && questionBroker.hasPendingQuestion(msg.address.chatId)) {
-    questionBroker.handleFreeTextAnswer(adapter, msg.address.chatId, rawText);
-    ack();
-    return;
-  }
-
   // Handle image-only download failures — surface error to user instead of silently dropping
   if (!rawText && !hasAttachments) {
     const rawData = msg.raw as { imageDownloadFailed?: boolean; failedCount?: number } | undefined;
