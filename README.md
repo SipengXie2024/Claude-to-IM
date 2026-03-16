@@ -1,224 +1,139 @@
 # Claude-to-IM
 
-English | [中文](README.zh-CN.md)
+Host-agnostic bridge connecting [Claude Code SDK](https://docs.anthropic.com/en/docs/claude-code) to instant messaging platforms.
 
-Claude-to-IM is a host-agnostic bridge library that connects [Claude Code SDK](https://docs.anthropic.com/en/docs/claude-code/sdk) to IM platforms, allowing users to interact with Claude through Telegram, Discord, and Feishu (Lark).
-
-This library handles all IM-side complexity — message routing, streaming previews, permission approval flows, Markdown rendering, chunking, retry, rate limiting — while delegating persistence, LLM calls, and permission resolution to the host application through a set of dependency injection interfaces.
-
-## Out-of-the-Box Solution
-
-If you want a ready-to-use desktop application without writing any integration code, check out [CodePilot](https://github.com/op7418/CodePilot) — a desktop GUI client for Claude Code with built-in IM bridge support. CodePilot implements all the host interfaces for you and provides a complete UI for managing sessions, settings, and bridge connections.
-
-Claude-to-IM was extracted from CodePilot as a standalone library for developers who want to embed the IM bridge capability in their own applications.
+Chat with Claude Code directly from Telegram, Discord, Feishu (Lark), or QQ — with full tool usage, permission control, and streaming status updates.
 
 ## Features
 
-- **Multi-platform adapters**: Telegram (long polling), Discord (Gateway WebSocket), Feishu/Lark (WSClient)
-- **Streaming previews**: Real-time response drafts via message editing, with per-platform throttling
-- **Permission management**: Interactive inline buttons for Claude Code tool approvals (allow / deny / allow for session)
-- **Session binding**: Each IM chat maps to a persistent conversation session with working directory and model settings
-- **Markdown rendering**: Platform-native formatting — HTML for Telegram, Discord-flavored Markdown, Feishu rich text cards
-- **Reliable delivery**: Auto-chunking at platform limits, retry with exponential backoff, HTML fallback on parse errors, message deduplication
-- **Security**: Input validation, token bucket rate limiting (20 msg/min per chat), user authorization whitelists, full audit logging
-- **Host-agnostic**: All host dependencies abstracted via 4 DI interfaces — no database driver, no LLM client, no framework lock-in
+- **Multi-platform adapters** — Telegram, Discord, Feishu, QQ
+- **Full Claude Code capabilities** — file editing, bash commands, web search, MCP tools, etc.
+- **Permission modes** — `default`, `accept-edits`, `bypass` (auto-approve all tools)
+- **Streaming preview** — real-time tool status updates in chat
+- **Interactive AskUserQuestion** — inline buttons for single/multi-select questions
+- **Daemon self-protection** — prevents accidental self-termination
+- **Markdown rendering** — platform-native formatting (HTML for TG, Discord markdown, etc.)
+- **SIGUSR2 graceful restart** — zero-downtime daemon reload
 
 ## Architecture
 
 ```
-IM Platform (Telegram / Discord / Feishu)
-        |
-        | InboundMessage
-        v
-   +-----------+     +------------------+
-   |  Adapter   |---->| Bridge Manager   |  (orchestrator)
-   +-----------+     |  |- Channel Router     -> session binding
-                     |  |- Conversation Engine -> LLM streaming
-                     |  |- Permission Broker   -> tool approval flow
-                     |  |- Delivery Layer      -> chunking, retry, dedup
-                     +------------------+
-                            |
-                            | Host Interfaces (DI)
-                            v
-                     +------------------+
-                     | Host Application |  (implements BridgeStore,
-                     |                  |   LLMProvider, etc.)
-                     +------------------+
+┌─────────────────────────────────────────────┐
+│  IM Platform (Telegram / Discord / Feishu)  │
+└──────────────────┬──────────────────────────┘
+                   │
+┌──────────────────▼──────────────────────────┐
+│  Bridge Layer  (src/lib/bridge/)            │
+│  ├── adapters/     Platform-specific I/O    │
+│  ├── conversation-engine.ts   Session mgmt  │
+│  ├── bridge-manager.ts        Command router│
+│  ├── question-broker.ts       AskUserQuestion│
+│  └── security/     Permission & validation  │
+└──────────────────┬──────────────────────────┘
+                   │
+┌──────────────────▼──────────────────────────┐
+│  Host Layer  (src/host/)                    │
+│  ├── main.ts          Entry point & daemon  │
+│  ├── llm-provider.ts  Claude Agent SDK glue │
+│  ├── store.ts         Session persistence   │
+│  └── config.ts        Environment config    │
+└──────────────────┬──────────────────────────┘
+                   │
+           Claude Code CLI
 ```
-
-All bridge modules access host services through a DI context (`getBridgeContext()`), never through direct imports. This means you can plug the bridge into any Node.js application by implementing four interfaces.
 
 ## Quick Start
 
-### 1. Install
+### Prerequisites
+
+- Node.js >= 20
+- Claude Code CLI installed (`npm install -g @anthropic-ai/claude-code`)
+- A bot token for your IM platform
+
+### Install & Build
 
 ```bash
-npm install claude-to-im
-```
-
-Or clone this repo and install dependencies:
-
-```bash
-git clone https://github.com/op7418/Claude-to-IM.git
+git clone https://github.com/SipengXie2024/Claude-to-IM.git
 cd Claude-to-IM
 npm install
+npm run build
 ```
 
-### 2. Implement Host Interfaces
+### Configure
 
-The bridge requires four interfaces. See [`docs/development.md`](docs/development.md) for the full specification of each interface.
+Create a `config.env` in your config directory (`~/.claude-to-im/` by default):
 
-```typescript
-import { initBridgeContext } from 'claude-to-im/context';
-import type { BridgeStore, LLMProvider, PermissionGateway, LifecycleHooks } from 'claude-to-im/host';
+```env
+# Required: at least one platform
+CTI_TG_TOKEN=your-telegram-bot-token
 
-const store: BridgeStore = { /* your persistence layer (~30 methods) */ };
-const llm: LLMProvider = { /* wraps Claude Code SDK streamChat */ };
-const permissions: PermissionGateway = { /* resolves pending tool permissions */ };
-const lifecycle: LifecycleHooks = { /* optional start/stop callbacks */ };
+# Optional
+CTI_DISCORD_TOKEN=your-discord-bot-token
+CTI_FEISHU_APP_ID=your-feishu-app-id
+CTI_FEISHU_APP_SECRET=your-feishu-app-secret
 
-initBridgeContext({ store, llm, permissions, lifecycle });
+# Allowed user IDs (comma-separated)
+CTI_TG_ALLOWED_USERS=123456789
+CTI_DISCORD_ALLOWED_USERS=123456789
+
+# Working directory for Claude Code
+CTI_WORK_DIR=/path/to/your/project
+
+# Default permission mode: default | accept-edits | bypass
+CTI_DEFAULT_MODE=default
 ```
 
-### 3. Start the Bridge
-
-```typescript
-import * as bridgeManager from 'claude-to-im/bridge-manager';
-
-await bridgeManager.start();
-
-const status = bridgeManager.getStatus();
-// { running: true, adapters: [{ channelType: 'telegram', running: true, ... }] }
-```
-
-### 4. Run the Example
-
-A self-contained example with in-memory store and echo LLM is included:
+### Run
 
 ```bash
-npx tsx src/lib/bridge/examples/mock-host.ts
+# Start as daemon
+bash scripts/daemon.sh start
+
+# Check status
+bash scripts/daemon.sh status
+
+# Stop
+bash scripts/daemon.sh stop
 ```
 
-## Configuration
-
-All settings are read through `BridgeStore.getSetting(key)`. Your host application decides how to store and surface these values (database, env vars, config file, UI settings panel, etc.).
-
-### Required Settings
-
-| Key | Description |
-|-----|-------------|
-| `remote_bridge_enabled` | Master switch — `"true"` to enable the bridge |
-| `bridge_{adapter}_bot_token` | Bot token for the platform (e.g. `bridge_telegram_bot_token`) |
-| `bridge_{adapter}_allowed_users` | Comma-separated user IDs authorized to use the bridge |
-
-### Optional Settings
-
-| Key | Description | Default |
-|-----|-------------|---------|
-| `bridge_auto_start` | Auto-start bridge on app launch | `"false"` |
-| `bridge_{adapter}_enabled` | Per-adapter toggle | `"false"` |
-| `bridge_{adapter}_stream_enabled` | Enable streaming previews | `"true"` |
-| `bridge_default_cwd` | Default working directory for new sessions | `$HOME` |
-| `bridge_model` | Default Claude model | Host decides |
-
-Replace `{adapter}` with `telegram`, `discord`, or `feishu`.
-
-## Limitations
-
-Before adopting this library, be aware of the following constraints:
-
-### You Must Implement the Host Interfaces
-
-This is a library, not a standalone application. You need to provide:
-
-- **`BridgeStore`** — A persistence layer with ~30 methods covering settings, sessions, messages, channel bindings, audit logs, dedup tracking, permission links, and channel offsets. This is the largest integration surface. See the full interface definition in [`src/lib/bridge/host.ts`](src/lib/bridge/host.ts).
-- **`LLMProvider`** — A wrapper around your LLM client that returns a `ReadableStream<string>` of SSE-formatted events. The stream format must match the Claude Code SDK's event protocol (text, tool_use, tool_result, permission_request, status, result events). See [`docs/development.md`](docs/development.md) for the full event format spec.
-- **`PermissionGateway`** — A way to resolve pending tool permissions from the Claude Code SDK.
-- **`LifecycleHooks`** — Optional callbacks for bridge start/stop events.
-
-### LLM Stream Format
-
-The `LLMProvider.streamChat()` must return SSE-formatted strings matching the Claude Code SDK's event protocol. If you are not using the Claude Code SDK, you need to adapt your LLM client's output to match this format. This is not a generic "chat completion" interface.
-
-### No Built-in Persistence
-
-The bridge does not bundle any database driver. You provide all persistence through `BridgeStore`. This gives you full control but means you need to implement storage for sessions, messages, bindings, audit logs, dedup keys, permission links, and channel offsets.
-
-### Session Locking
-
-The bridge uses a session lock mechanism (`acquireSessionLock` / `renewSessionLock` / `releaseSessionLock`) to serialize messages within the same session. Your `BridgeStore` implementation must provide atomic lock operations. For single-process deployments, in-memory locks work fine. For multi-process deployments, you need distributed locking (e.g., database-backed).
-
-### Platform Bot Setup
-
-You still need to create bots on each platform and obtain tokens:
-- **Telegram**: Create a bot via [@BotFather](https://t.me/BotFather)
-- **Discord**: Create an application in the [Developer Portal](https://discord.com/developers/applications) with Message Content Intent enabled
-- **Feishu**: Create an app in the [Developer Console](https://open.feishu.cn/app) with IM permissions
-
-## Documentation
-
-| Document | Description |
-|----------|-------------|
-| [Development Guide](docs/development.md) | Host interface specs, SSE format, adapter development, step-by-step integration tutorial |
-| [Architecture](src/lib/bridge/ARCHITECTURE.md) | Module dependency graph, message flows, design decisions |
-| [Security](src/lib/bridge/SECURITY.md) | Threat model, mitigations, deployment recommendations |
-| [Contributing](src/lib/bridge/CONTRIBUTING.md) | Dev setup, code style, testing guide |
-| [Migration](src/lib/bridge/MIGRATION.md) | Before/after import patterns for migrating from direct imports |
-
-## Project Structure
-
-```
-src/
-  lib/bridge/
-    context.ts              # DI container (initBridgeContext / getBridgeContext)
-    host.ts                 # Host interface definitions (BridgeStore, LLMProvider, etc.)
-    types.ts                # Shared type definitions (messages, bindings, status)
-    bridge-manager.ts       # Orchestrator — start/stop, message dispatch, session locks
-    channel-adapter.ts      # Abstract base class + adapter registry
-    channel-router.ts       # ChannelAddress -> ChannelBinding resolution
-    conversation-engine.ts  # LLM stream processing, SSE consumption
-    delivery-layer.ts       # Reliable outbound delivery (chunk, retry, dedup, audit)
-    permission-broker.ts    # Tool permission forwarding and callback handling
-    adapters/
-      telegram-adapter.ts   # Telegram Bot API long polling
-      discord-adapter.ts    # Discord.js Gateway WebSocket
-      feishu-adapter.ts     # Feishu/Lark WSClient
-      telegram-media.ts     # Telegram file download/attachment handling
-      telegram-utils.ts     # Telegram API helpers
-      index.ts              # Side-effect imports for adapter self-registration
-    markdown/
-      ir.ts                 # Intermediate representation for Markdown AST
-      render.ts             # Generic IR -> platform string renderer
-      telegram.ts           # Markdown -> Telegram HTML
-      discord.ts            # Markdown -> Discord-flavored Markdown
-      feishu.ts             # Markdown -> Feishu rich text / cards
-    security/
-      validators.ts         # Input validation (path traversal, injection, sanitization)
-      rate-limiter.ts       # Token bucket rate limiter (per chat)
-    examples/
-      mock-host.ts          # Runnable example with InMemoryStore + EchoLLM
-  __tests__/unit/
-    bridge-channel-router.test.ts
-    bridge-delivery-layer.test.ts
-    bridge-manager.test.ts
-    bridge-permission-broker.test.ts
-```
-
-## Testing
+### Deploy as Claude Code Skill
 
 ```bash
-# Type checking
-npm run typecheck
-
-# Unit tests (28 tests)
-npm run test:unit
-
-# Both
-npm run test
+npm run deploy  # builds + copies daemon.mjs to skill directory
 ```
 
-Tests use Node.js built-in test runner (`node:test`) with mock implementations of all host interfaces — no real database or LLM required.
+## Bot Commands
+
+| Command | Description |
+|---------|-------------|
+| `/start` | Start a new conversation |
+| `/compact` | Compact conversation context |
+| `/mode <mode>` | Switch permission mode |
+| `/cost` | Show token usage |
+| `/plan` | Enter plan mode |
+| `/status` | Show session status |
+
+## Multi-Instance
+
+Run multiple instances by setting `CTI_HOME`:
+
+```bash
+# Instance 1 (default)
+bash scripts/daemon.sh start
+
+# Instance 2 with separate config
+CTI_HOME=~/.claude-to-im-2 bash scripts/daemon.sh start
+```
+
+## Development
+
+```bash
+npm run typecheck    # Type check
+npm run test:unit    # Run unit tests
+npm run test         # typecheck + tests
+npm run example      # Run mock host example
+```
 
 ## License
 
-MIT
+[MIT](LICENSE)

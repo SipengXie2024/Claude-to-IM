@@ -345,6 +345,7 @@ export class SDKLLMProvider implements LLMProvider {
               abortController: params.abortController,
               permissionMode: (isBypass ? 'acceptEdits' : params.permissionMode as 'default' | 'acceptEdits' | 'plan') || undefined,
               includePartialMessages: true,
+              betas: ['context-1m-2025-08-07'],
               env: cleanEnv,
               // Inject Claude2IM context so the LLM knows it's in an IM bridge
               systemPrompt: {

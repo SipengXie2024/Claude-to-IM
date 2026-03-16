@@ -2,6 +2,11 @@
   "name": "claude-to-im",
   "version": "0.1.0",
   "description": "Host-agnostic bridge connecting Claude Code SDK to IM platforms (Telegram, Discord, Feishu)",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/SipengXie2024/Claude-to-IM.git"
+  },
   "type": "module",
   "main": "dist/lib/bridge/context.js",
   "types": "dist/lib/bridge/context.d.ts",
